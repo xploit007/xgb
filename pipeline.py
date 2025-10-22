@@ -792,6 +792,7 @@ def parse_args(argv: Optional[List[str]] = None):
 
     tp = sub.add_parser("train", help="Train XGBoost model; can merge on the fly")
     tp.add_argument("--train-csv", help="Pre-merged CSV to train on")
+    tp.add_argument("--csv", help="Alias for --train-csv (absolute or relative path)")
     tp.add_argument("--input-dirs", nargs="+", help="Directories to scan and merge for training")
     tp.add_argument("--target-majority", choices=["benign", "attack"], default="benign")
     tp.add_argument("--target-ratio", type=float, default=0.6)
@@ -831,7 +832,8 @@ def parse_args(argv: Optional[List[str]] = None):
 
     pp = sub.add_parser("predict", help="Run inference on a CSV with trained artifacts")
     pp.add_argument("--model-dir", default=os.path.join("xgboost", "artifacts"))
-    pp.add_argument("--input-csv", required=True)
+    pp.add_argument("--input-csv", required=False)
+    pp.add_argument("--predict", help="Alias for --input-csv (absolute or relative path)")
     pp.add_argument("--output-csv", required=True)
     pp.add_argument("--fpr-target", type=float, default=None, help="Optional FPR target to retune threshold on input (requires labels)")
     pp.add_argument("--retune-threshold", action="store_true", help="If set and labels exist, retune threshold on this input for given FPR target")
@@ -844,7 +846,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     try:
         if args.cmd == "train":
             cfg = TrainConfig(
-                train_csv=args.train_csv,
+                train_csv=(args.csv or args.train_csv),
                 input_dirs=args.input_dirs,
                 target_majority=args.target_majority,
                 target_ratio=args.target_ratio,
@@ -890,7 +892,10 @@ def main(argv: Optional[List[str]] = None) -> int:
             return 0
 
         if args.cmd == "predict":
-            predict_on_csv(args.model_dir, args.input_csv, args.output_csv, args.fpr_target, args.retune_threshold)
+            input_csv = args.predict or args.input_csv
+            if not input_csv:
+                raise ValueError("Provide --predict or --input-csv")
+            predict_on_csv(args.model_dir, input_csv, args.output_csv, args.fpr_target, args.retune_threshold)
             return 0
 
         logger.error("Unknown command: %s", args.cmd)
