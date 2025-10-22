@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from typing import List, Optional, Dict, Tuple
 
 import numpy as np
+import glob
 import pandas as pd
 
 LOG_FORMAT = "%(asctime)s %(levelname)s [%(name)s] %(message)s"
@@ -20,6 +21,7 @@ class MergeConfig:
     target_ratio: float = 0.6  # majority class proportion
     max_rows_per_source: Optional[int] = None
     random_state: int = 42
+    data_root: Optional[str] = None
 
 
 @dataclass
@@ -33,6 +35,7 @@ class PresetConfig:
     max_rows_per_source: Optional[int] = None
     random_state: int = 42
     family_eval: bool = True
+    data_root: Optional[str] = None
 
 
 BENIGN_VALUES = {"benign", "normal"}
@@ -57,6 +60,38 @@ def list_csv_files_under_dirs(dirs: List[str]) -> List[str]:
     return csvs
 
 
+def _resolve_dir(root: Optional[str], d: str) -> str:
+    if os.path.isabs(d):
+        return d
+    if root:
+        return os.path.join(root, d)
+    return d
+
+
+def _expand_dirs(root: Optional[str], patterns: List[str]) -> List[str]:
+    out: List[str] = []
+    for pat in patterns:
+        rd = _resolve_dir(root, pat)
+        matches = glob.glob(rd)
+        if not matches:
+            if os.path.isdir(rd):
+                out.append(rd)
+            else:
+                logger.warning("No directory match for: %s", rd)
+            continue
+        for m in matches:
+            if os.path.isdir(m):
+                out.append(m)
+    # de-duplicate while preserving order
+    seen = set()
+    uniq = []
+    for d in out:
+        if d not in seen:
+            uniq.append(d)
+            seen.add(d)
+    return uniq
+
+
 def read_dataset(csv_path: str, max_rows: Optional[int] = None, random_state: int = 42) -> pd.DataFrame:
     df = pd.read_csv(csv_path)
     if max_rows is not None and len(df) > max_rows:
@@ -75,8 +110,9 @@ def normalize_labels(df: pd.DataFrame, label_col: str = "label") -> pd.Series:
 
 def merge_datasets(cfg: MergeConfig) -> str:
     np.random.seed(cfg.random_state)
-    csvs = list_csv_files_under_dirs(cfg.input_dirs)
-    logger.info("Found %d CSV files under %s", len(csvs), cfg.input_dirs)
+    dirs = _expand_dirs(cfg.data_root, cfg.input_dirs)
+    csvs = list_csv_files_under_dirs(dirs)
+    logger.info("Found %d CSV files under %s", len(csvs), dirs)
 
     frames: List[pd.DataFrame] = []
     for csv in csvs:
@@ -130,17 +166,20 @@ def merge_datasets(cfg: MergeConfig) -> str:
     return cfg.output_csv
 
 
-def _autodetect_malicious_dirs() -> List[str]:
-    dirs = []
-    for name in os.listdir('.'):
-        if os.path.isdir(name) and name.lower().startswith('malicious_') and name.lower().endswith('.csv'):
+def _autodetect_malicious_dirs(root: Optional[str] = None) -> List[str]:
+    base = root or '.'
+    dirs: List[str] = []
+    for name in os.listdir(base):
+        full = os.path.join(base, name)
+        if os.path.isdir(full) and name.lower().startswith('malicious_') and name.lower().endswith('.csv'):
             dirs.append(name)
     return sorted(dirs)
 
 
-def _read_dirs_concat(dirs: List[str], max_rows: Optional[int], seed: int) -> pd.DataFrame:
+def _read_dirs_concat(dirs: List[str], max_rows: Optional[int], seed: int, root: Optional[str]) -> pd.DataFrame:
     frames: List[pd.DataFrame] = []
-    for d in dirs:
+    resolved = [_resolve_dir(root, d) for d in dirs]
+    for d in resolved:
         csvs = list_csv_files_under_dirs([d])
         for csv in csvs:
             frames.append(read_dataset(csv, max_rows, seed))
@@ -191,20 +230,20 @@ def _make_eval_mix(benign_df: pd.DataFrame, mal_df: pd.DataFrame, ratio: float, 
 
 
 def create_presets(cfg: PresetConfig) -> Dict[str, str]:
-    malicious_dirs = cfg.malicious_dirs or _autodetect_malicious_dirs()
+    malicious_dirs = cfg.malicious_dirs or _autodetect_malicious_dirs(cfg.data_root)
     if not malicious_dirs:
         raise RuntimeError("No malicious directories provided or autodetected")
     ensure_dir(cfg.output_dir)
 
     # Read benign
-    train_benign = _read_dirs_concat(cfg.train_benign_dirs, cfg.max_rows_per_source, cfg.random_state)
-    eval_benign = _read_dirs_concat(cfg.eval_benign_dirs, cfg.max_rows_per_source, cfg.random_state)
+    train_benign = _read_dirs_concat(cfg.train_benign_dirs, cfg.max_rows_per_source, cfg.random_state, cfg.data_root)
+    eval_benign = _read_dirs_concat(cfg.eval_benign_dirs, cfg.max_rows_per_source, cfg.random_state, cfg.data_root)
 
     # Read malicious families
     mal_family_frames: List[Tuple[str, pd.DataFrame]] = []
     for d in malicious_dirs:
         try:
-            df = _read_dirs_concat([d], cfg.max_rows_per_source, cfg.random_state)
+            df = _read_dirs_concat([d], cfg.max_rows_per_source, cfg.random_state, cfg.data_root)
             mal_family_frames.append((d, df))
         except Exception as e:
             logger.warning("Skipping %s: %s", d, e)
@@ -289,23 +328,25 @@ def parse_args():
     sub = p.add_subparsers(dest="cmd")
 
     mp = sub.add_parser("merge", help="Merge CSV folders into a single dataset with class ratio")
-    mp.add_argument("--input-dirs", nargs="+", default=["."], help="Directories to scan for CSV files")
+    mp.add_argument("--input-dirs", nargs="+", default=["."], help="Directories to scan for CSV files (absolute or relative to --data-root)")
     mp.add_argument("--output-csv", required=True, help="Path to write merged CSV")
     mp.add_argument("--target-majority", choices=["benign", "attack"], default="benign")
     mp.add_argument("--target-ratio", type=float, default=0.6, help="Majority class proportion (0.01-0.99)")
     mp.add_argument("--max-rows-per-source", type=int, default=None, help="Optional cap per input CSV for sampling")
     mp.add_argument("--random-state", type=int, default=42)
+    mp.add_argument("--data-root", help="Optional root directory that prefixes all --input-dirs")
 
     pp = sub.add_parser("preset", help="Create preset train/eval splits (Mon-Wed benign train; Thu-Fri benign eval; equal-share malicious in train; leakage-free eval)")
-    pp.add_argument("--train-benign-dirs", nargs="+", default=["benign_monday.csv", "benign_tuesday.csv", "benign_wednesday.csv"], help="Dirs for training benign")
-    pp.add_argument("--eval-benign-dirs", nargs="+", default=["benign_thursday.csv", "benign_friday.csv"], help="Dirs for evaluation benign")
-    pp.add_argument("--malicious-dirs", nargs="+", help="Dirs for malicious families; autodetect if omitted")
+    pp.add_argument("--train-benign-dirs", nargs="+", default=["benign_monday.csv", "benign_tuesday.csv", "benign_wednesday.csv"], help="Dirs for training benign (absolute or relative to --data-root)")
+    pp.add_argument("--eval-benign-dirs", nargs="+", default=["benign_thursday.csv", "benign_friday.csv"], help="Dirs for evaluation benign (absolute or relative to --data-root)")
+    pp.add_argument("--malicious-dirs", nargs="+", help="Dirs for malicious families; autodetect 'malicious_*' under --data-root if omitted")
     pp.add_argument("--output-dir", default=os.path.join("xgboost", "data", "splits"))
     pp.add_argument("--train-ratio", type=float, default=0.6, help="Benign-majority proportion for training (0.01-0.99)")
     pp.add_argument("--mixed-eval-ratios", nargs="+", type=float, default=[0.6, 0.9, 0.99], help="Benign-majority proportions for mixed eval sets")
     pp.add_argument("--max-rows-per-source", type=int, default=None)
     pp.add_argument("--random-state", type=int, default=42)
     pp.add_argument("--no-family-eval", action="store_true", help="Disable per-family evaluation set generation")
+    pp.add_argument("--data-root", help="Optional root directory that prefixes all dataset directories and autodetection")
 
     return p.parse_args()
 
@@ -324,6 +365,7 @@ def main() -> int:
                 max_rows_per_source=args.max_rows_per_source,
                 random_state=args.random_state,
                 family_eval=(not args.no_family_eval),
+                data_root=args.data_root,
             )
             outputs = create_presets(cfg)
             for k, v in outputs.items():
@@ -338,6 +380,7 @@ def main() -> int:
             target_ratio=getattr(args, 'target_ratio', 0.6),
             max_rows_per_source=getattr(args, 'max_rows_per_source', None),
             random_state=getattr(args, 'random_state', 42),
+            data_root=getattr(args, 'data_root', None),
         )
         merge_datasets(cfg)
         return 0
